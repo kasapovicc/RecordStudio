@@ -155,6 +155,8 @@ struct ExportSheet: View {
 
     // MARK: Choosing
 
+    private let textWidth = 360.0
+
     private var choices: some View {
         let o = $model.exportSettings, format = model.exportSettings.format
         return Form {
@@ -162,11 +164,14 @@ struct ExportSheet: View {
                 ForEach(ExportFormat.allCases, id: \.self) { Text($0.label).tag($0) }
             }
             .pickerStyle(.segmented)
+            // The form takes its widest row's width, and a text grows with its words, so the description and the name
+            // get a set width; otherwise a long one pushes the sheet's content past its edges.
             VStack(alignment: .leading, spacing: Space.xxs) {
                 Text(format.detail).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 if let blocker = model.formatBlocker { Label(blocker, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange) }
             }
             .font(.callout)
+            .frame(width: textWidth, alignment: .leading)
 
             // Popups left over from the other appearance come up blank, so they're made anew when it changes.
             Group {
@@ -198,6 +203,7 @@ struct ExportSheet: View {
                     TextField("Name", text: $model.exportName, prompt: Text(model.title)).labelsHidden()
                     Text(".\(format.fileExtension)").foregroundStyle(.secondary)
                 }
+                .frame(width: textWidth)
             }
             LabeledContent("Where") { FolderMenu(folder: o.folder) }
 
