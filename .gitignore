@@ -1,0 +1,8 @@
+.build/
+build/
+.swiftpm/
+.env
+.DS_Store
+*.log
+Tests/RecordKitTests/.out/
+.vscode/

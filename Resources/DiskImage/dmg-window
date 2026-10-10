@@ -1,0 +1,134 @@
+#!/usr/bin/env swift
+// Lays out the disk image's drag-to-install window. `make dmg` runs it twice:
+//
+//   dmg-window --render <folder>   draws <folder>/.background/background.tiff (1× and 2×) before the image is made
+//   dmg-window --layout <volume>   has Finder set the mounted read-write image's window size, view, background and
+//                                  icon positions, which it saves in the volume's .DS_Store
+//
+// Finder draws icon labels black in light mode and white in dark mode over the same picture, so the band the labels
+// sit on is a mid graphite that both read on at 4.5:1. Everything else stays in the brand's graphite, with one red dot.
+import AppKit
+
+let window = CGSize(width: 640, height: 400)               // content area, in points
+let iconSize = 128.0
+let app = CGPoint(x: 176, y: 224)                          // icon centres, from the window's top left
+let applications = CGPoint(x: 464, y: 224)
+let band: UInt32 = 0x75767A                                // under the labels: 4.5:1 to both black and white text
+
+func color(_ hex: UInt32, _ alpha: CGFloat = 1) -> CGColor {
+    CGColor(srgbRed: CGFloat(hex >> 16 & 0xFF) / 255, green: CGFloat(hex >> 8 & 0xFF) / 255, blue: CGFloat(hex & 0xFF) / 255, alpha: alpha)
+}
+
+func render(scale: CGFloat) -> CGImage {
+    let space = CGColorSpace(name: CGColorSpace.sRGB)!
+    let ctx = CGContext(data: nil, width: Int(window.width * scale), height: Int(window.height * scale), bitsPerComponent: 8,
+                        bytesPerRow: 0, space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+    // Draw in points from the top left, like Finder's icon positions.
+    ctx.translateBy(x: 0, y: window.height * scale)
+    ctx.scaleBy(x: scale, y: -scale)
+
+    // Graphite, darkest behind the line of text and settling to the label band from the icons down.
+    let fill = CGGradient(colorsSpace: space, colors: [color(0x3A3C41), color(0x5E6065), color(band), color(band), color(0x6F7074)] as CFArray,
+                          locations: [0, 0.32, 0.6, 0.84, 1])!
+    ctx.drawLinearGradient(fill, start: .zero, end: CGPoint(x: 0, y: window.height), options: [])
+
+    // The instruction, in the system font at the site's heading weight, centred over the pair.
+    let font = NSFont.systemFont(ofSize: 17, weight: .semibold)
+    let text = NSAttributedString(string: "Drag RecordStudio to Applications",
+                                  attributes: [.font: font, .foregroundColor: NSColor(cgColor: color(0xF2F2F5))!, .kern: -0.4])
+    let line = CTLineCreateWithAttributedString(text)
+    let width = CTLineGetTypographicBounds(line, nil, nil, nil)
+    ctx.saveGState()
+    ctx.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
+    ctx.textPosition = CGPoint(x: (window.width - width) / 2, y: 94)
+    CTLineDraw(line, ctx)
+    ctx.restoreGState()
+
+    // The cue: a hairline from the app to Applications with the record dot on it and a chevron at the end.
+    // The same gap at both ends, so the dot sits on the window's centre line, as the icons do.
+    let from = app.x + iconSize / 2 + 26, to = applications.x - iconSize / 2 - 26, y = app.y
+    ctx.setLineCap(.round)
+    ctx.setLineJoin(.round)
+    ctx.setStrokeColor(color(0xF2F2F5, 0.5))
+    ctx.setLineWidth(1.5)
+    let mid = (from + to) / 2, gap = 14.0                // the line stops short of the ring on both sides
+    ctx.strokeLineSegments(between: [CGPoint(x: from, y: y), CGPoint(x: mid - gap, y: y), CGPoint(x: mid + gap, y: y), CGPoint(x: to, y: y)])
+    ctx.setLineWidth(2)
+    ctx.addLines(between: [CGPoint(x: to - 6, y: y - 6), CGPoint(x: to, y: y), CGPoint(x: to - 6, y: y + 6)])
+    ctx.strokePath()
+    ctx.setStrokeColor(color(0xE5484D, 0.55))
+    ctx.setLineWidth(2)
+    ctx.strokeEllipse(in: CGRect(x: mid - 10, y: y - 10, width: 20, height: 20))
+    ctx.setFillColor(color(0xE5484D))
+    ctx.fillEllipse(in: CGRect(x: mid - 5, y: y - 5, width: 10, height: 10))
+
+    // The app icon's focus brackets around Applications and its name: this is where it goes.
+    // A square, like the brackets on the app icon, with the same gap above the folder as below its name.
+    let box = CGRect(x: applications.x - 82, y: applications.y - 62, width: 164, height: 164)
+    let arm = 20.0
+    ctx.setStrokeColor(color(0xF2F2F5, 0.9))
+    ctx.setLineWidth(2) // the chevron's and the ring's weight; the brackets lead by brightness, not thickness
+    for (corner, dx, dy) in [(CGPoint(x: box.minX, y: box.minY), 1.0, 1.0), (CGPoint(x: box.maxX, y: box.minY), -1, 1),
+                             (CGPoint(x: box.minX, y: box.maxY), 1, -1), (CGPoint(x: box.maxX, y: box.maxY), -1, -1)] {
+        ctx.addLines(between: [CGPoint(x: corner.x, y: corner.y + dy * arm), corner, CGPoint(x: corner.x + dx * arm, y: corner.y)])
+    }
+    ctx.strokePath()
+    return ctx.makeImage()!
+}
+
+/// One TIFF holding the 1× and 2× pictures, so Finder picks the sharp one on a Retina display.
+func writeBackground(into folder: URL) throws {
+    let dir = folder.appending(path: ".background")
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let dest = CGImageDestinationCreateWithURL(dir.appending(path: "background.tiff") as CFURL, "public.tiff" as CFString, 2, nil)!
+    for scale in [1.0, 2.0] {
+        let dpi = 72 * scale
+        CGImageDestinationAddImage(dest, render(scale: scale), [kCGImagePropertyDPIWidth: dpi, kCGImagePropertyDPIHeight: dpi,
+                                                                       kCGImagePropertyTIFFDictionary: [kCGImagePropertyTIFFCompression: 5]] as CFDictionary) // LZW
+    }
+    guard CGImageDestinationFinalize(dest) else { throw CocoaError(.fileWriteUnknown) }
+}
+
+func layOut(volume: URL) throws {
+    // Bounds include the title bar, which is all the chrome left once the toolbar is hidden.
+    let titleBar = 28, left = 200, top = 120
+    let script = """
+    tell application "Finder"
+        set d to (POSIX file "\(volume.path)" as alias)
+        open d
+        set w to container window of d
+        set current view of w to icon view
+        set toolbar visible of w to false
+        set statusbar visible of w to false
+        set bounds of w to {\(left), \(top), \(left + Int(window.width)), \(top + titleBar + Int(window.height))}
+        set o to icon view options of w
+        set arrangement of o to not arranged
+        set icon size of o to \(Int(iconSize))
+        set text size of o to 13
+        set label position of o to bottom
+        set shows item info of o to false
+        set shows icon preview of o to false
+        set background picture of o to file ".background:background.tiff" of d
+        set position of item "RecordStudio.app" of d to {\(Int(app.x)), \(Int(app.y))}
+        set position of item "Applications" of d to {\(Int(applications.x)), \(Int(applications.y))}
+        update d without registering applications
+        delay 1
+        close w
+    end tell
+    """
+    let p = Process()
+    p.executableURL = URL(filePath: "/usr/bin/osascript")
+    p.arguments = ["-e", script]
+    try p.run()
+    p.waitUntilExit()
+    guard p.terminationStatus == 0 else { throw CocoaError(.executableLoad) }
+}
+
+let args = Array(CommandLine.arguments.dropFirst())
+switch (args.first, args.count) {
+case ("--render", 2): try writeBackground(into: URL(filePath: args[1]))
+case ("--layout", 2): try layOut(volume: URL(filePath: args[1]))
+default:
+    FileHandle.standardError.write(Data("usage: dmg-window --render <folder> | --layout <volume>\n".utf8))
+    exit(2)
+}
