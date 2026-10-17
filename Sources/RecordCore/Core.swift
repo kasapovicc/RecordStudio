@@ -924,7 +924,8 @@ public func frameLabel(_ s: OutputSize) -> String {
 public enum Tuning {
     public static let ramp = 1.1         // seconds to ease in/out of a zoom
     public static let follow = 0.28      // per-stage time constant (s) of the two-stage camera follow
-    public static let cameraFPS = 30.0
+    public static let deadZone = 0.5     // middle part of the zoomed view (fraction of its size) the cursor moves in without moving the camera
+    public static let cameraFPS = 60.0    // one camera sample per frame of 60 fps output (see outputFrameRate)
     public static let cursorFPS = 60.0
 }
 
@@ -1030,12 +1031,36 @@ public func clickAnimation(_ clicks: [Double], _ t: Double, duration: Double = C
 }
 
 /// One zoom per burst of clicks: leads in so it's settled by the click, lingers after, merges clicks closer than `gap`.
-public func autoZooms(_ cursor: [CursorSample], duration: Double, scale: Double = 1.8, gap: Double = 1.2) -> [Zoom] {
-    var zooms: [Zoom] = []
+/// Each zoom is pinned on its clicks, so the camera holds still. A click outside the middle of the zoomed view
+/// starts a new zoom touching the last one (the camera zooms out of one spot and into the next), when the clicks are
+/// at least `apart` seconds apart; closer than that, the zoom follows the cursor instead. `crop` is the edits'
+/// crop, which focus points are relative to.
+// ponytail: touching zooms zoom out and back in; overlapping them would pan between the spots instead.
+public func autoZooms(_ cursor: [CursorSample], duration: Double, crop: NRect = .full, scale: Double = 1.8, gap: Double = 1.2,
+                      apart: Double = 2) -> [Zoom] {
+    let span = Tuning.deadZone / scale, half = 0.5 / scale
+    func fits(_ ps: [Point]) -> Bool {
+        let xs = ps.map(\.x), ys = ps.map(\.y)
+        return xs.max()! - xs.min()! <= span && ys.max()! - ys.min()! <= span
+    }
+    var zooms: [Zoom] = [], clicks: [[(t: Double, at: Point)]] = []
     for t in clickTimes(cursor) {
-        let start = clamp(t - 0.9, 0, duration), end = clamp(t + 2.6, 0, duration)
-        if let last = zooms.last, start - last.end < gap { zooms[zooms.count - 1].end = end }
-        else { zooms.append(Zoom(start: start, end: end, scale: scale)) }
+        let start = clamp(t - 0.9, 0, duration), end = clamp(t + 2.6, 0, duration), at = toCrop(cursorAt(cursor, t), crop)
+        if let last = zooms.last, let prev = clicks.last, start - last.end < gap {
+            if fits(prev.map(\.at) + [at]) || t - prev.last!.t < apart {
+                zooms[zooms.count - 1].end = end; clicks[clicks.count - 1].append((t, at))
+                continue
+            }
+            zooms[zooms.count - 1].end = (prev.last!.t + t) / 2 // the next zoom starts where this one ends
+            zooms.append(Zoom(start: zooms[zooms.count - 1].end, end: end, scale: scale))
+        } else {
+            zooms.append(Zoom(start: start, end: end, scale: scale))
+        }
+        clicks.append([(t, at)])
+    }
+    for (i, ps) in clicks.enumerated() where fits(ps.map(\.at)) {
+        let xs = ps.map(\.at.x), ys = ps.map(\.at.y)
+        zooms[i].focus = Point(x: clamp((xs.max()! + xs.min()!) / 2, half, 1 - half), y: clamp((ys.max()! + ys.min()!) / 2, half, 1 - half))
     }
     return zooms.filter { $0.end - $0.start > 0.3 }
 }
@@ -1098,15 +1123,18 @@ public func toCrop(_ p: Point, _ c: NRect) -> Point { Point(x: (p.x - c.x) / c.w
 /// That's ≈ a critically damped spring: it accelerates into a move instead of jumping to full speed the way a
 /// single exponential filter does. Look points up with `pathAt`. Smoothing runs in output time, so it follows as
 /// closely in a part played at `speeds` as at 1×.
-public func smoothPath(_ cursor: [CursorSample], duration: Double, fps: Double, follow: Double, speeds: [SpeedRegion] = []) -> [Point] {
+/// With `aim`, the path follows `aim(t, the last point aimed at, cursor)` instead of the cursor (see `cameraPath`).
+public func smoothPath(_ cursor: [CursorSample], duration: Double, fps: Double, follow: Double, speeds: [SpeedRegion] = [],
+                       aim: ((Double, Point?, Point) -> Point)? = nil) -> [Point] {
     let n = max(1, Int((duration * fps).rounded(.up)))
     var out: [Point] = []
     out.reserveCapacity(n + 1)
-    var ax = Double.nan, ay = 0.0, fx = 0.0, fy = 0.0
+    var ax = Double.nan, ay = 0.0, fx = 0.0, fy = 0.0, target: Point?
     for i in 0...n {
         let t = min(duration, Double(i) / fps)
         let alpha = follow > 0 ? 1 - exp(-1 / fps / speedAt(speeds, t) / follow) : 1
-        let c = cursorAt(cursor, t)
+        var c = cursorAt(cursor, t)
+        if let aim { c = aim(t, target, c); target = c }
         if ax.isNaN { (ax, ay, fx, fy) = (c.x, c.y, c.x, c.y) }
         ax += (c.x - ax) * alpha; ay += (c.y - ay) * alpha
         fx += (ax - fx) * alpha; fy += (ay - fy) * alpha
@@ -1141,17 +1169,38 @@ public func cameraPath(_ cursor: [CursorSample], _ edits: Edits, duration: Doubl
         var z = z; (z.start, z.end) = (sourceToOutput(warp, z.start), sourceToOutput(warp, z.end)); return z
     }
     let fps = Tuning.cameraFPS
-    let smooth = smoothPath(cursor, duration: duration, fps: fps, follow: Tuning.follow, speeds: speeds)
+    let crop = edits.crop
+    let smooth = smoothPath(cursor, duration: duration, fps: fps, follow: Tuning.follow, speeds: speeds) { t, last, c in
+        let o = sourceToOutput(warp, t), a = activeZoom(zooms, o)
+        // Moves inside the middle of the zoomed view leave the camera still. Once the cursor leaves it, the camera
+        // re-centres on the cursor in one smooth pan, rather than creeping along with it at the edge.
+        let d = Tuning.deadZone * 0.5 / (a.map { 1 + ($0.zoom.scale - 1) * $0.w } ?? 1)
+        var p = last.map { abs(c.x - $0.x) <= d * crop.w && abs(c.y - $0.y) <= d * crop.h ? $0 : c } ?? c
+        // Kept where the full view of this zoom (or the next) fits in the frame, so the camera slows into an edge
+        // instead of stopping at it.
+        if let next = a?.zoom ?? zooms.filter({ $0.start >= o }).min(by: { $0.start < $1.start }) {
+            let h = 0.5 / next.scale
+            p = Point(x: clamp(p.x, crop.x + crop.w * h, crop.x + crop.w * (1 - h)), y: clamp(p.y, crop.y + crop.h * h, crop.y + crop.h * (1 - h)))
+        }
+        return p
+    }
     var out: [CameraPoint] = []
     out.reserveCapacity(smooth.count)
     for (i, p) in smooth.enumerated() {
         let t = min(duration, Double(i) / fps)
-        let c = toCrop(p, edits.crop), fx = c.x, fy = c.y
-        let a = activeZoom(zooms, sourceToOutput(warp, t))
-        let z = a.map { 1 + ($0.zoom.scale - 1) * $0.w } ?? 1
-        // A pinned zoom eases from the cursor-following camera onto its focus, in step with the zoom itself.
-        var x = fx, y = fy
-        if let a, let f = a.zoom.focus { x = fx + (f.x - fx) * a.w; y = fy + (f.y - fy) * a.w }
+        let o = sourceToOutput(warp, t), follow = toCrop(p, crop)
+        // Each zoom eases the camera from where it is onto its own zoom and focus (pinned, or following the cursor):
+        // from the centre for one zoom on its own, and over the earlier one where zooms overlap, which comes back as
+        // the later one eases out, so there's no jump at a handover. A focus where the full zoom fits stays inside
+        // the frame all the way in, so the clamp below rarely acts.
+        var amount = 0.0, offset = Point(x: 0, y: 0)
+        for zoom in zooms {
+            let w = weight(zoom, o), f = zoom.focus ?? follow
+            guard w > 0 else { continue }
+            amount += (zoom.scale - 1 - amount) * w
+            offset = Point(x: offset.x + (f.x - 0.5 - offset.x) * w, y: offset.y + (f.y - 0.5 - offset.y) * w)
+        }
+        let z = 1 + amount, x = 0.5 + offset.x, y = 0.5 + offset.y
         let half = 0.5 / z
         out.append(CameraPoint(t: t, z: z, x: clamp(x, half, 1 - half), y: clamp(y, half, 1 - half)))
     }
@@ -1190,6 +1239,14 @@ public enum ExportQuality: String, CaseIterable, Codable, Sendable {
     var bitsPerPixel: Double {
         switch self { case .standard: 0.08; case .high: 0.14; case .maximum: 0.25 }
     }
+}
+
+/// Frame rate of the preview and video exports. An imported video keeps its standard rate (23.976 → 24, 29.97 → 30).
+/// Screen captures run at up to 60 fps with an uneven rate, so their measured average (about 58) renders at 60:
+/// at 58 a 60 Hz display repeats about two frames a second, and zooms and pans skip.
+public func outputFrameRate(_ measured: Double) -> Double {
+    let r = measured.rounded()
+    return [24, 25, 30, 50].contains(r) && abs(measured - r) < 0.1 ? r : 60
 }
 
 /// Target video bitrate in bits per second. HEVC gets the same quality from about 60% of the bits.
