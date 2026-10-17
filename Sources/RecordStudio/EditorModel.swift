@@ -754,7 +754,7 @@ final class EditorModel {
         case .split: split()
         case .addMarker: addMarker()
         case .addText: addCallout()
-        case .frameBack, .frameForward: step(by: (action == .frameBack ? -1 : 1) / max(1, rec.fps))
+        case .frameBack, .frameForward: step(by: (action == .frameBack ? -1 : 1) / outputFrameRate(rec.fps))
         case .secondBack, .secondForward: step(by: action == .secondBack ? -1 : 1)
         case .previousEdit, .nextEdit: jumpToEdit(forward: action == .nextEdit)
         case .playBackward, .playForward: shuttle(forward: action == .playForward)
@@ -1093,7 +1093,7 @@ final class EditorModel {
             bytes = gifEstimatedBytes(size, seconds: len, o.gif)
         } else {
             let s = exportSize(o.resolution)
-            bytes = videoEstimatedBytes(width: s.width, height: s.height, fps: rec.fps, seconds: len, o.quality, hevc: o.format != .mp4)
+            bytes = videoEstimatedBytes(width: s.width, height: s.height, fps: outputFrameRate(rec.fps), seconds: len, o.quality, hevc: o.format != .mp4)
         }
         return "\(formatTime(len)) · about \(ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file))"
     }

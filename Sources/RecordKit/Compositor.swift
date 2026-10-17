@@ -271,12 +271,13 @@ public struct Sources: @unchecked Sendable {
 
 public enum Composition {
     /// A video composition that renders `edits` over the sources. Times seen by the renderer are recording times.
+    /// `fps` is the recording's measured rate; the composition runs at `outputFrameRate(fps)`.
     public static func make(_ src: Sources, renderer: FrameRenderer, fps: Double) async throws -> AVVideoComposition {
         let duration = try await src.asset.load(.duration)
         var config = AVVideoComposition.Configuration()
         config.customVideoCompositorClass = StudioCompositor.self
         config.renderSize = CGSize(width: renderer.size.width, height: renderer.size.height)
-        config.frameDuration = CMTime(value: 1, timescale: CMTimeScale(max(24, min(60, fps.rounded()))))
+        config.frameDuration = CMTime(value: 1, timescale: CMTimeScale(outputFrameRate(fps)))
         config.instructions = [StudioInstruction(timeRange: CMTimeRange(start: .zero, duration: duration), trackID: src.screenTrack,
                                                  cameraTrackID: src.cameraTrack, clipTrackIDs: src.clipVideo, overlayTrackIDs: src.overlayVideo,
                                                  renderer: renderer, segments: src.segments)]

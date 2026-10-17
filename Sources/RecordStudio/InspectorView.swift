@@ -606,7 +606,7 @@ private struct ZoomPane: View {
 
     private func redetect() {
         model.selectedZoom = nil
-        model.edits.zooms = autoZooms(model.edits.timelineCursor(model.cursor), duration: model.duration)
+        model.edits.zooms = autoZooms(model.edits.timelineCursor(model.cursor), duration: model.duration, crop: model.edits.crop)
     }
 
     var body: some View {

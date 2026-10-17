@@ -35,6 +35,26 @@ private func edits(_ f: (inout Edits) -> Void = { _ in }) -> Edits {
         #expect(abs(z[1].start - 9.1) < 1e-6 && abs(z[1].end - 12.6) < 1e-6)
         #expect(autoZooms([CursorSample(t: 0.1, x: 0, y: 0, down: true)], duration: 1).first.map { ($0.start, $0.end) }! == (0, 1))
     }
+    @Test func pinsZoomsWhoseClicksFitInOneView() {
+        func click(_ t: Double, _ x: Double, _ y: Double) -> [CursorSample] {
+            [CursorSample(t: t - 0.05, x: x, y: y, down: false), CursorSample(t: t, x: x, y: y, down: true), CursorSample(t: t + 0.05, x: x, y: y, down: false)]
+        }
+        let one = autoZooms(click(2, 0.4, 0.6), duration: 10)
+        #expect(one.count == 1 && one[0].focus == Point(x: 0.4, y: 0.6))
+        // At 1.8× the clicks may span 0.5 / 1.8 ≈ 0.28 of the frame; these span 0.2, so they're pinned on their middle.
+        let tight = autoZooms(click(2, 0.3, 0.5) + click(3, 0.5, 0.6), duration: 10)
+        #expect(tight.count == 1 && abs(tight[0].focus!.x - 0.4) < 1e-9 && abs(tight[0].focus!.y - 0.55) < 1e-9)
+        // Clicks across the screen 1 s apart: one zoom that follows the cursor.
+        let wide = autoZooms(click(2, 0.1, 0.5) + click(3, 0.9, 0.5), duration: 10)
+        #expect(wide.count == 1 && wide[0].focus == nil)
+        // 3 s apart: two pinned zooms that meet halfway between the clicks.
+        let split = autoZooms(click(2, 0.1, 0.5) + click(5, 0.9, 0.5), duration: 10)
+        #expect(split.map(\.start) == [1.1, 3.5] && split.map(\.end) == [3.5, 7.6])
+        #expect(split.map { $0.focus?.x } == [0.5 / 1.8, 1 - 0.5 / 1.8])
+        // Kept where the full view fits, and relative to the crop: the right half's middle is x = 0.5 there.
+        #expect(autoZooms(click(2, 0.02, 0.98), duration: 10)[0].focus == Point(x: 0.5 / 1.8, y: 1 - 0.5 / 1.8))
+        #expect(autoZooms(click(2, 0.75, 0.5), duration: 10, crop: NRect(x: 0.5, y: 0, w: 0.5, h: 1))[0].focus == Point(x: 0.5, y: 0.5))
+    }
     @Test func easesInAndOutWithoutAJolt() {
         let zs = [Zoom(start: 0, end: 3, scale: 2)]
         #expect(zoomAt(zs, 0) == 1)
@@ -265,14 +285,67 @@ private func edits(_ f: (inout Edits) -> Void = { _ in }) -> Edits {
         let ramp = cameraAt(path, 1.3)
         #expect(ramp.x > 0.3 && ramp.x < 0.9)
     }
-    @Test func followsTheCursorSmoothlyInCropCoordinates() {
+    @Test func followsTheCursorSmoothlyInCropCoordinates() throws {
         // Held at 4× so the edge clamp doesn't pin the camera; the cursor crosses the right half of the crop.
         let e = edits { $0.crop = NRect(x: 0.5, y: 0, w: 0.5, h: 1); $0.zooms = [Zoom(start: -5, end: 10, scale: 4)] }
         let path = cameraPath([CursorSample(t: 0, x: 0.75, y: 0.5, down: false), CursorSample(t: 1, x: 1, y: 0.5, down: false)], e, duration: 2)
-        let xs = path.prefix(16).map(\.x)
-        #expect(zip(xs, xs.dropFirst()).allSatisfy { $0 <= $1 }) // monotone, no overshoot
-        #expect(xs[15] < 1) // lags behind the raw cursor
-        #expect(xs[2] - xs[1] < xs[8] - xs[7]) // accelerates into the pan
+        let xs = (0...30).map { cameraAt(path, Double($0) / 30).x }, steps = zip(xs.dropFirst(), xs).map(-)
+        #expect(steps.allSatisfy { $0 >= 0 }) // monotone, no overshoot
+        #expect(xs[30] < 1) // lags behind the raw cursor
+        // Accelerates into the pan once the cursor leaves the dead zone.
+        let start = try #require(steps.firstIndex { $0 > 0 })
+        #expect(steps[start] < steps[start + 6])
+    }
+    @Test func easesToTheEdgeWhenZoomingInNearACorner() {
+        // Like a real recording: the cursor near the top-left corner, moving down while the zoom eases in.
+        let e = edits { $0.zooms = [Zoom(start: 0, end: 10, scale: 1.8)] }
+        let path = cameraPath([CursorSample(t: 0, x: 0.19, y: 0.34, down: false), CursorSample(t: 0.55, x: 0.19, y: 0.34, down: false),
+                               CursorSample(t: 0.85, x: 0.2, y: 0.48, down: false)], e, duration: 4)
+        let frames = (0...150).map { cameraAt(path, Double($0) / 60) }
+        // The zoomed view never leaves the frame.
+        #expect(frames.allSatisfy { abs($0.x - 0.5) <= 0.5 - 0.5 / $0.z + 1e-9 && abs($0.y - 0.5) <= 0.5 - 0.5 / $0.z + 1e-9 })
+        // No sudden stop: the speed (frame widths per second) changes by only a little from one frame to the next.
+        let vy = zip(frames.dropFirst(), frames).map { ($0.y - $1.y) * 60 }, vx = zip(frames.dropFirst(), frames).map { ($0.x - $1.x) * 60 }
+        let jolt = max(zip(vy.dropFirst(), vy).map { abs($0 - $1) }.max()!, zip(vx.dropFirst(), vx).map { abs($0 - $1) }.max()!)
+        #expect(jolt < 0.05) // a hard stop at the edge was 0.28
+    }
+    @Test func changesSpeedEveryFrameOfA60FPSVideo() {
+        // A pan seen frame by frame at 60 fps: with a sample per frame its speed never holds for two frames and jumps.
+        let e = edits { $0.zooms = [Zoom(start: -5, end: 10, scale: 2)] }
+        let path = cameraPath([CursorSample(t: 0, x: 0.3, y: 0.5, down: false), CursorSample(t: 2, x: 0.3, y: 0.5, down: false),
+                               CursorSample(t: 2.1, x: 0.7, y: 0.5, down: false)], e, duration: 4)
+        let xs = (120...180).map { cameraAt(path, Double($0) / 60).x }
+        let speeds = zip(xs.dropFirst(), xs).map(-)
+        #expect(zip(speeds.dropFirst(), speeds).allSatisfy { abs($0 - $1) > 1e-9 })
+    }
+    @Test func holdsStillThroughSmallMovesAndFollowsBigOnes() {
+        let e = edits { $0.zooms = [Zoom(start: -5, end: 20, scale: 2)] } // view half-width 0.25, dead zone half-width 0.125
+        // A wobble of ±0.05 for 3 s, then a move to x = 0.7. Checked once the zoom has eased in from t = 0.
+        let wobble = (0...30).map { i in CursorSample(t: Double(i) / 10, x: 0.5 + (i % 2 == 0 ? 0.05 : -0.05), y: 0.5, down: false) }
+        let path = cameraPath(wobble + [CursorSample(t: 3.5, x: 0.7, y: 0.5, down: false)], e, duration: 8)
+        #expect(stride(from: 1.5, through: 3, by: 0.05).allSatisfy { abs(cameraAt(path, $0).x - 0.55) < 1e-9 })
+        // Re-centres on where the cursor left the dead zone, just short of where it stopped (0.575 kept it at the edge).
+        #expect(abs(cameraAt(path, 7).x - 0.7) < 0.03)
+    }
+    @Test func handsOverBetweenOverlappingZoomsWithoutAJump() {
+        // Two pinned zooms on opposite sides, overlapping from 4 to 6 s.
+        let e = edits { $0.zooms = [Zoom(start: 0, end: 6, scale: 2, focus: Point(x: 0.3, y: 0.5)),
+                                    Zoom(start: 4, end: 10, scale: 2, focus: Point(x: 0.7, y: 0.5))] }
+        let path = cameraPath([CursorSample(t: 0, x: 0.5, y: 0.5, down: false)], e, duration: 10)
+        let frames = (0...600).map { cameraAt(path, Double($0) / 60) }
+        #expect(zip(frames.dropFirst(), frames).allSatisfy { abs($0.x - $1.x) < 0.02 && abs($0.z - $1.z) < 0.03 }) // it jumped 0.4 in a frame
+        #expect(abs(cameraAt(path, 3).x - 0.3) < 1e-9 && abs(cameraAt(path, 8).x - 0.7) < 1e-9)
+        #expect(abs(cameraAt(path, 5).z - 2) < 1e-3) // stays zoomed in through the handover
+    }
+    @Test func pansInStepsInsteadOfCreepingAfterADriftingCursor() {
+        // The cursor drifts from x = 0.4 to 0.7 over 6 s at 2×: the camera holds still between a few deliberate pans.
+        let e = edits { $0.zooms = [Zoom(start: -5, end: 20, scale: 2)] }
+        let path = cameraPath([CursorSample(t: 1, x: 0.4, y: 0.5, down: false), CursorSample(t: 7, x: 0.7, y: 0.5, down: false)], e, duration: 10)
+        // From t = 4 s, once the cursor has left the first dead zone.
+        let xs = stride(from: 4.0, through: 7, by: 1.0 / 60).map { cameraAt(path, $0).x }
+        let still = Double(zip(xs.dropFirst(), xs).filter { abs($0 - $1) * 60 < 0.02 }.count) / Double(xs.count - 1)
+        #expect(still > 0.2) // creeping along at the edge, it was never still
+        #expect(abs(cameraAt(path, 9).x - 0.7) < 0.125)   // the cursor ends inside the dead zone
     }
 }
 
@@ -309,6 +382,12 @@ private func edits(_ f: (inout Edits) -> Void = { _ in }) -> Edits {
         #expect(exportBitrate(width: 1920, height: 1080, fps: 30, .standard, hevc: false) < exportBitrate(width: 1920, height: 1080, fps: 30, .maximum, hevc: false))
         #expect(exportBitrate(width: 1920, height: 1080, fps: 30, .high, hevc: true) < exportBitrate(width: 1920, height: 1080, fps: 30, .high, hevc: false))
         #expect(exportBitrate(width: 1920, height: 1080, fps: 120, .high, hevc: false) == exportBitrate(width: 1920, height: 1080, fps: 60, .high, hevc: false))
+    }
+    @Test func rendersScreenCapturesAt60AndImportedVideosAtTheirOwnRate() {
+        // Screen captures average just under 60 (frames only come when the screen changes), or far less on a still screen.
+        for measured in [57.04, 58.16, 59.94, 60, 41.7, 12.3] { #expect(outputFrameRate(measured) == 60) }
+        #expect(outputFrameRate(23.976) == 24 && outputFrameRate(25) == 25 && outputFrameRate(29.97) == 30 && outputFrameRate(50) == 50)
+        #expect(outputFrameRate(120) == 60)
     }
     @Test func fitsTheRecordingInsideAChosenAspectRatio() {
         // 16:10 recording into a vertical 9:16 frame: full width minus padding, centred vertically.

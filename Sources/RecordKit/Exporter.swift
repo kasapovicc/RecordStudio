@@ -277,7 +277,7 @@ public enum Exporter {
         let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
         writer.shouldOptimizeForNetworkUse = true
         let hevc = job.format == .hevc
-        let fps = min(60, max(1, job.fps))
+        let fps = outputFrameRate(job.fps)
         var compression: [String: Any] = [
             AVVideoAverageBitRateKey: exportBitrate(width: size.width, height: size.height, fps: fps, job.quality, hevc: hevc),
             AVVideoExpectedSourceFrameRateKey: fps,
